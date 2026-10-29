@@ -28,3 +28,235 @@
   }
   main {
     width: 100%;
+    max-width: 560px;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    gap: 12px;
+  }
+  h1 { font-size: 1.15rem; margin: 0; font-weight: 700; }
+  .join { display: flex; gap: 8px; flex-wrap: wrap; }
+  input {
+    font: inherit;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--ink);
+    min-width: 0;
+  }
+  .join input { flex: 1 1 120px; }
+  button {
+    font: inherit;
+    cursor: pointer;
+    border: 0;
+    border-radius: 8px;
+    padding: 10px 16px;
+    background: var(--accent);
+    color: #fff;
+  }
+  button:focus-visible, input:focus-visible { outline: 3px solid #8fc3ad; outline-offset: 2px; }
+  #status { font-size: 0.9rem; color: var(--muted); min-height: 1.4em; }
+  #status.err { color: var(--rec); }
+  #log {
+    flex: 1;
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .msg { padding: 8px 12px; border-radius: 8px; background: var(--bg); max-width: 85%; word-break: break-word; }
+  .msg.mine { background: var(--mine); align-self: flex-start; }
+  .msg .who { font-size: 0.8rem; color: var(--muted); display: block; }
+  .msg button { padding: 4px 12px; margin-top: 4px; font-size: 0.9rem; }
+  #talk {
+    height: 96px;
+    font-size: 1.2rem;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #talk.rec { background: var(--rec); }
+  #talk:disabled, #send:disabled { background: #9aa6a0; cursor: not-allowed; }
+  .send { display: flex; gap: 8px; }
+  .send input { flex: 1; }
+  @media (prefers-reduced-motion: no-preference) {
+    #talk { transition: background 0.15s; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>WalkieTalkie – نسخة اللاب توب</h1>
+
+  <div class="join">
+    <input id="name" placeholder="اسمك" autocomplete="off">
+    <input id="room" placeholder="اسم الغرفة" autocomplete="off">
+    <button id="joinBtn">ادخل الغرفة</button>
+  </div>
+  <div id="status" role="status"></div>
+
+  <div id="log" aria-live="polite"></div>
+
+  <button id="talk" disabled>🎙 اضغط وتكلم</button>
+
+  <div class="send">
+    <input id="msg" placeholder="اكتب رسالة" autocomplete="off">
+    <button id="send" disabled>إرسال</button>
+  </div>
+</main>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script>
+  // Same Firebase project as the Android app
+  const firebaseConfig = {
+    apiKey: "AIzaSyAaZYV2-DhfqZtmiOcYc_ksk0_rI6UoOYM",
+    projectId: "walkietalkie-d2e40"
+  };
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.firestore();
+
+  const $ = id => document.getElementById(id);
+  const logEl = $("log"), statusEl = $("status"), talk = $("talk"), sendBtn = $("send");
+
+  let me = null, room = null, unsub = null, firstLoad = true;
+  let recorder = null, chunks = [], stream = null, recStart = 0, stopTimer = null;
+
+  function setStatus(t, isErr) {
+    statusEl.textContent = t || "";
+    statusEl.className = isErr ? "err" : "";
+  }
+
+  function msgs() {
+    return db.collection("rooms").doc(room).collection("messages");
+  }
+
+  function addLine(sender, text, audio, mime) {
+    const div = document.createElement("div");
+    div.className = "msg" + (sender === me ? " mine" : "");
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = sender;
+    div.appendChild(who);
+    if (audio) {
+      const b = document.createElement("button");
+      b.textContent = "▶ 🎙 رسالة صوتية";
+      b.onclick = () => play(audio, mime);
+      div.appendChild(b);
+    } else {
+      div.appendChild(document.createTextNode(text || ""));
+    }
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function play(b64, mime) {
+    try {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: mime || "audio/mp4" }));
+      const a = new Audio(url);
+      a.onended = () => URL.revokeObjectURL(url);
+      a.play().catch(() => setStatus("المتصفح منع التشغيل التلقائي، اضغطي ▶ على الرسالة", true));
+    } catch (e) {
+      setStatus("تعذر تشغيل الصوت", true);
+    }
+  }
+
+  $("joinBtn").onclick = () => {
+    const n = $("name").value.trim(), r = $("room").value.trim();
+    if (!n || !r) { setStatus("اكتبي الاسم والغرفة", true); return; }
+    if (unsub) unsub();
+    me = n; room = r; firstLoad = true;
+    logEl.innerHTML = "";
+    unsub = msgs().orderBy("ts").onSnapshot(snap => {
+      snap.docChanges().forEach(c => {
+        if (c.type !== "added") return;
+        const d = c.doc.data();
+        if (d.type === "voice") {
+          addLine(d.sender, null, d.audio, d.mime);
+          if (!firstLoad && d.sender !== me) play(d.audio, d.mime);
+        } else {
+          addLine(d.sender, d.text);
+        }
+      });
+      firstLoad = false;
+    }, err => setStatus("خطأ: " + err.message, true));
+    talk.disabled = false;
+    sendBtn.disabled = false;
+    setStatus("دخلتي الغرفة: " + room);
+  };
+
+  function sendText() {
+    const t = $("msg").value.trim();
+    if (!room || !t) return;
+    msgs().add({
+      type: "text",
+      sender: me,
+      text: t,
+      ts: firebase.firestore.FieldValue.serverTimestamp()
+    }).catch(e => setStatus("خطأ: " + e.message, true));
+    $("msg").value = "";
+  }
+  sendBtn.onclick = sendText;
+  $("msg").addEventListener("keydown", e => { if (e.key === "Enter") sendText(); });
+
+  async function startRec() {
+    if (!room || recorder) return;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      setStatus("اسمحي للمتصفح باستخدام الميكروفون", true);
+      return;
+    }
+    const mime = MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "audio/webm;codecs=opus";
+    recorder = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 24000 });
+    chunks = [];
+    recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    recorder.onstop = () => finishRec(mime);
+    recorder.start();
+    recStart = Date.now();
+    talk.classList.add("rec");
+    talk.textContent = "🔴 بتسجل...";
+    stopTimer = setTimeout(stopRec, 12000);
+  }
+
+  function stopRec() {
+    clearTimeout(stopTimer);
+    if (recorder && recorder.state === "recording") recorder.stop();
+  }
+
+  function finishRec(mime) {
+    talk.classList.remove("rec");
+    talk.textContent = "🎙 اضغط وتكلم";
+    stream.getTracks().forEach(t => t.stop());
+    const tooShort = Date.now() - recStart < 500;
+    const blob = new Blob(chunks, { type: mime });
+    recorder = null;
+    if (tooShort) return;
+    const fr = new FileReader();
+    fr.onload = () => {
+      const b64 = String(fr.result).split(",")[1];
+      msgs().add({
+        type: "voice",
+        sender: me,
+        audio: b64,
+        mime: mime.split(";")[0],
+        ts: firebase.firestore.FieldValue.serverTimestamp()
+      }).catch(e => setStatus("خطأ: " + e.message, true));
+    };
+    fr.readAsDataURL(blob);
+  }
+
+  talk.addEventListener("pointerdown", e => { e.preventDefault(); startRec(); });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(ev => talk.addEventListener(ev, stopRec));
+</script>
+</body>
+</html>
